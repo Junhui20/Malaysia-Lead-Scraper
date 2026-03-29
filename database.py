@@ -42,6 +42,10 @@ def init_db() -> None:
                 phone TEXT DEFAULT '',
                 phone_type TEXT DEFAULT '',
                 website TEXT DEFAULT '',
+                website_phone TEXT DEFAULT '',
+                website_phone_type TEXT DEFAULT '',
+                website_phone2 TEXT DEFAULT '',
+                website_phone2_type TEXT DEFAULT '',
                 address TEXT DEFAULT '',
                 category TEXT DEFAULT '',
                 company_size TEXT DEFAULT '',
@@ -69,7 +73,24 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+
+            CREATE INDEX IF NOT EXISTS idx_companies_session
+                ON companies(session_id);
+            CREATE INDEX IF NOT EXISTS idx_companies_website
+                ON companies(website) WHERE website != '';
         """)
+
+        # Migrate: add website_phone columns if missing (existing databases)
+        existing_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(companies)").fetchall()
+        }
+        if "website_phone" not in existing_cols:
+            conn.execute("ALTER TABLE companies ADD COLUMN website_phone TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE companies ADD COLUMN website_phone_type TEXT DEFAULT ''")
+        if "website_phone2" not in existing_cols:
+            conn.execute("ALTER TABLE companies ADD COLUMN website_phone2 TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE companies ADD COLUMN website_phone2_type TEXT DEFAULT ''")
 
         default_tags = [
             ("已打電話", "#3B82F6"),
@@ -175,24 +196,9 @@ def get_company_count() -> int:
         return conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
 
 
-def update_company_field(company_id: int, field: str, value: str) -> None:
-    allowed = {
-        "name", "phone", "phone_type", "website", "address",
-        "category", "company_size", "rating", "tags", "notes",
-    }
-    if field not in allowed or not is_safe_column_name(field):
-        return
-    with _conn() as conn:
-        conn.execute(
-            f"UPDATE companies SET {field} = ?, updated_at = ? WHERE id = ?",
-            (value, datetime.now().isoformat(), company_id),
-        )
-        conn.commit()
-
-
 def update_companies_from_df(df: pd.DataFrame) -> int:
     """Batch update companies from an edited DataFrame. Returns rows updated."""
-    editable = {"name", "phone", "phone_type", "website", "address", "category", "tags", "notes"}
+    editable = {"name", "phone", "phone_type", "website", "website_phone", "website_phone_type", "address", "category", "tags", "notes"}
     cols_in_df = [c for c in df.columns if c in editable and is_safe_column_name(c)]
     if not cols_in_df:
         return 0
@@ -219,16 +225,40 @@ def update_companies_from_df(df: pd.DataFrame) -> int:
         return len(rows_to_update)
 
 
-def delete_companies(company_ids: list[int]) -> int:
-    if not company_ids:
+def update_website_phones(results: list[dict]) -> int:
+    """Bulk update website_phone from verification results. Returns count updated."""
+    if not results:
+        return 0
+    now = datetime.now().isoformat()
+    rows = [
+        (
+            r["website_phone"], r.get("website_phone_type", ""),
+            r.get("website_phone2", ""), r.get("website_phone2_type", ""),
+            now, r["id"],
+        )
+        for r in results if r.get("website_phone")
+    ]
+    if not rows:
         return 0
     with _conn() as conn:
-        placeholders = ",".join("?" * len(company_ids))
-        deleted = conn.execute(
-            f"DELETE FROM companies WHERE id IN ({placeholders})", company_ids
-        ).rowcount
+        conn.executemany(
+            "UPDATE companies SET website_phone = ?, website_phone_type = ?, "
+            "website_phone2 = ?, website_phone2_type = ?, "
+            "updated_at = ? WHERE id = ?",
+            rows,
+        )
         conn.commit()
-        return deleted
+    return len(rows)
+
+
+def get_companies_with_website() -> list[dict]:
+    """Get companies that have a website URL (for phone verification)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, phone, website, website_phone "
+            "FROM companies WHERE website LIKE 'http%' ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def _dedup_score(r: dict) -> int:
@@ -303,14 +333,6 @@ def delete_tag(tag_name: str) -> None:
         conn.execute("DELETE FROM tags WHERE name = ?", (tag_name,))
         conn.commit()
 
-
-def update_tag(old_name: str, new_name: str, color: str) -> None:
-    with _conn() as conn:
-        conn.execute(
-            "UPDATE tags SET name = ?, color = ? WHERE name = ?",
-            (new_name, color, old_name),
-        )
-        conn.commit()
 
 
 def bulk_append_tag(company_ids: list[int], tag: str) -> int:

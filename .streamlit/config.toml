@@ -1,8 +1,9 @@
 [theme]
-primaryColor = "#2563EB"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F8FAFC"
-textColor = "#1E293B"
+# Purity UI Dashboard theme
+primaryColor = "#4FD1C5"
+backgroundColor = "#F7FAFC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#2D3748"
 font = "sans serif"
 
 [server]

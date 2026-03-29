@@ -7,12 +7,22 @@ MOBILE_PREFIXES = (
 )
 PHONE_PATTERN = re.compile(r"(\+?6?0\d[\d\s\-]{7,12})")
 
+# Tighter pattern for website extraction (min 9 digits when cleaned)
+MY_PHONE_PATTERN = re.compile(r"(\+?6?0[1-9][\d\s\-\.]{7,13})")
+
+# Context words near phone numbers (increases confidence)
+PHONE_CONTEXT_WORDS = re.compile(
+    r"(phone|tel|call|contact|mobile|fax|whatsapp|hotline|office|"
+    r"hubungi|telefon|talian)",
+    re.IGNORECASE,
+)
+
 _SAFE_COL = re.compile(r"^[a-z_]+$")
 
 
 def classify_phone(phone: str) -> str:
     """Classify phone number as mobile or landline."""
-    cleaned = re.sub(r"[\s\-\+]", "", phone)
+    cleaned = re.sub(r"[\s\-\+\.]", "", phone)
     if cleaned.startswith("60"):
         cleaned = "0" + cleaned[2:]
     for prefix in MOBILE_PREFIXES:
@@ -24,6 +34,31 @@ def classify_phone(phone: str) -> str:
 def clean_phone(phone: str) -> str:
     """Strip non-digit characters from phone (keep +)."""
     return re.sub(r"[^\d\+]", "", phone)
+
+
+def normalize_my_phone(phone: str) -> str:
+    """Normalize to Malaysian local format: 0XX..."""
+    cleaned = clean_phone(phone)
+    # Fix +0XX (wrong format seen on some sites)
+    if cleaned.startswith("+0"):
+        cleaned = cleaned[1:]
+    elif cleaned.startswith("+60"):
+        cleaned = "0" + cleaned[3:]
+    elif cleaned.startswith("60") and len(cleaned) > 9:
+        cleaned = "0" + cleaned[2:]
+    return cleaned
+
+
+def is_valid_my_phone(phone: str) -> bool:
+    """Check if a cleaned phone looks like a real Malaysian number."""
+    digits = re.sub(r"[^\d]", "", phone)
+    if digits.startswith("60"):
+        digits = "0" + digits[2:]
+    if not digits.startswith("0"):
+        return False
+    if len(digits) < 9 or len(digits) > 12:
+        return False
+    return True
 
 
 def normalize_name(name: str) -> str:
