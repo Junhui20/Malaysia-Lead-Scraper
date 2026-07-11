@@ -1,5 +1,6 @@
 """SQLite database layer for Lead Scraper."""
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -71,6 +72,16 @@ def init_db() -> None:
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS saved_searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                params TEXT NOT NULL DEFAULT '{}',
+                last_run_at TEXT DEFAULT '',
+                last_result_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -97,6 +108,27 @@ def init_db() -> None:
         if "website_email" not in existing_cols:
             conn.execute("ALTER TABLE companies ADD COLUMN website_email TEXT DEFAULT ''")
             conn.execute("ALTER TABLE companies ADD COLUMN website_email2 TEXT DEFAULT ''")
+        # Migrate: add incremental-refresh tracking columns if missing (existing
+        # databases). first_seen / last_seen / last_updated power the scheduled
+        # "fresh monthly list" refresh and delta ("new since date X") exports.
+        # Existing rows are backfilled once from created_at / updated_at so that
+        # delta filters have a sensible baseline instead of empty strings.
+        if "first_seen" not in existing_cols:
+            conn.execute("ALTER TABLE companies ADD COLUMN first_seen TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE companies ADD COLUMN last_seen TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE companies ADD COLUMN last_updated TEXT DEFAULT ''")
+            conn.execute(
+                "UPDATE companies SET first_seen = COALESCE(NULLIF(first_seen, ''), created_at) "
+                "WHERE first_seen IS NULL OR first_seen = ''"
+            )
+            conn.execute(
+                "UPDATE companies SET last_seen = COALESCE(NULLIF(last_seen, ''), created_at) "
+                "WHERE last_seen IS NULL OR last_seen = ''"
+            )
+            conn.execute(
+                "UPDATE companies SET last_updated = COALESCE(NULLIF(last_updated, ''), updated_at) "
+                "WHERE last_updated IS NULL OR last_updated = ''"
+            )
 
         # Migrate: rename old Chinese default tags to English (existing databases).
         # Runs before the default-tag insert so the rename applies cleanly. Idempotent:
@@ -188,11 +220,81 @@ def get_session_companies(session_id: int) -> pd.DataFrame:
         )
 
 
+# ---- Saved Searches ----
+
+
+def create_saved_search(name: str, source: str, params: dict) -> int:
+    """Persist a named saved search. Overwrites params if the name already exists."""
+    with _conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO saved_searches (name, source, params) VALUES (?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET source = excluded.source, "
+            "params = excluded.params",
+            (name, source, json.dumps(params)),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id FROM saved_searches WHERE name = ?", (name,)
+        ).fetchone()
+        return row["id"] if row else cursor.lastrowid
+
+
+def get_saved_searches() -> list[dict]:
+    """Return all saved searches with params decoded into a dict."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM saved_searches ORDER BY name"
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["params"] = json.loads(d.get("params") or "{}")
+            except (ValueError, TypeError):
+                d["params"] = {}
+            result.append(d)
+        return result
+
+
+def get_saved_search(name: str) -> dict | None:
+    """Return a single saved search by name (params decoded), or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM saved_searches WHERE name = ?", (name,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["params"] = json.loads(d.get("params") or "{}")
+        except (ValueError, TypeError):
+            d["params"] = {}
+        return d
+
+
+def delete_saved_search(search_id: int) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM saved_searches WHERE id = ?", (search_id,))
+        conn.commit()
+
+
+def mark_saved_search_run(search_id: int, result_count: int) -> None:
+    """Record that a saved search was just executed by the refresh runner."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE saved_searches SET last_run_at = ?, last_result_count = ? "
+            "WHERE id = ?",
+            (datetime.now().isoformat(), result_count, search_id),
+        )
+        conn.commit()
+
+
 # ---- Companies ----
 
 
 def save_companies(companies: list[dict], session_id: int) -> int:
     with _conn() as conn:
+        now = datetime.now().isoformat()
         rows = [
             (
                 c.get("name", ""),
@@ -208,18 +310,166 @@ def save_companies(companies: list[dict], session_id: int) -> int:
                 c.get("jobstreet_url", ""),
                 c.get("hiredly_url", ""),
                 session_id,
+                now, now, now,
             )
             for c in companies
         ]
         conn.executemany(
             """INSERT INTO companies
                (name, phone, phone_type, website, address, category, company_size,
-                rating, sources, google_maps_url, jobstreet_url, hiredly_url, session_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rating, sources, google_maps_url, jobstreet_url, hiredly_url, session_id,
+                first_seen, last_seen, last_updated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
         conn.commit()
         return len(rows)
+
+
+# Fields whose change (a non-empty new value that differs from the stored value)
+# marks an existing company as "updated" during an incremental refresh.
+CHANGE_FIELDS = ("phone", "website", "website_phone", "website_email")
+
+
+def upsert_companies_incremental(
+    companies: list[dict], session_id: int
+) -> dict:
+    """Insert new companies and update changed ones, tracking timestamps.
+
+    Matches existing companies by normalized name (same key used for dedup).
+    - New company -> INSERT with first_seen = last_seen = last_updated = now.
+    - Existing company with a differing non-empty value in any CHANGE_FIELD ->
+      UPDATE those fields, bump last_seen and last_updated.
+    - Existing company with no change -> bump last_seen only.
+
+    Returns a summary dict: new, updated, unchanged (counts) plus new_ids and
+    updated_ids (lists of company IDs) so the caller can verify/export the delta.
+    """
+    now = datetime.now().isoformat()
+    with _conn() as conn:
+        by_key: dict[str, dict] = {}
+        for row in conn.execute("SELECT * FROM companies").fetchall():
+            key = normalize_name(row["name"])
+            if key:
+                by_key.setdefault(key, dict(row))
+
+        new_ids: list[int] = []
+        updated_ids: list[int] = []
+        unchanged = 0
+
+        for c in companies:
+            name = c.get("name", "")
+            key = normalize_name(name)
+            if not key:
+                continue
+
+            existing = by_key.get(key)
+            if existing is None:
+                cursor = conn.execute(
+                    """INSERT INTO companies
+                       (name, phone, phone_type, website, address, category,
+                        company_size, rating, sources, google_maps_url,
+                        jobstreet_url, hiredly_url, session_id,
+                        first_seen, last_seen, last_updated)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        name,
+                        c.get("phone", ""),
+                        c.get("phone_type", ""),
+                        c.get("website", ""),
+                        c.get("address", ""),
+                        c.get("category", ""),
+                        c.get("company_size", ""),
+                        c.get("rating", ""),
+                        c.get("sources", c.get("source", "")),
+                        c.get("google_maps_url", ""),
+                        c.get("jobstreet_url", ""),
+                        c.get("hiredly_url", ""),
+                        session_id,
+                        now, now, now,
+                    ),
+                )
+                new_id = cursor.lastrowid
+                new_ids.append(new_id)
+                # Register so a later row in the same batch matches this insert.
+                by_key[key] = {"id": new_id, "name": name, **c}
+                continue
+
+            changes: dict[str, str] = {}
+            for field in CHANGE_FIELDS:
+                new_val = str(c.get(field, "") or "").strip()
+                old_val = str(existing.get(field, "") or "").strip()
+                if new_val and new_val != old_val:
+                    changes[field] = new_val
+
+            if changes:
+                set_clause = ", ".join(f"{f} = ?" for f in changes)
+                values = list(changes.values())
+                # Keep phone_type consistent when phone changed.
+                if "phone" in changes:
+                    set_clause += ", phone_type = ?"
+                    values.append(classify_phone(changes["phone"]))
+                values.extend([now, now, existing["id"]])
+                conn.execute(
+                    f"UPDATE companies SET {set_clause}, "
+                    "last_seen = ?, last_updated = ? WHERE id = ?",
+                    values,
+                )
+                updated_ids.append(existing["id"])
+                existing.update(changes)
+            else:
+                conn.execute(
+                    "UPDATE companies SET last_seen = ? WHERE id = ?",
+                    (now, existing["id"]),
+                )
+                unchanged += 1
+
+        conn.commit()
+
+    return {
+        "new": len(new_ids),
+        "updated": len(updated_ids),
+        "unchanged": unchanged,
+        "new_ids": new_ids,
+        "updated_ids": updated_ids,
+    }
+
+
+def get_companies_added_since_rows(since: str) -> list[dict]:
+    """Return company rows with first_seen >= since (ISO date/datetime string).
+
+    Pandas-free variant used by the CLI refresh runner and by tests.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM companies WHERE first_seen != '' AND first_seen >= ? "
+            "ORDER BY first_seen",
+            (since,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_companies_updated_since_rows(since: str) -> list[dict]:
+    """Return company rows changed since `since` (last_updated >= since) that
+    were not first seen in the same window (i.e. genuinely updated, not new)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM companies WHERE last_updated != '' AND last_updated >= ? "
+            "AND (first_seen = '' OR first_seen < ?) ORDER BY last_updated",
+            (since, since),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_companies_added_since(since: str) -> pd.DataFrame:
+    """DataFrame of companies with first_seen >= since (for the UI delta view)."""
+    with _conn() as conn:
+        return pd.read_sql_query(
+            "SELECT * FROM companies WHERE first_seen != '' AND first_seen >= ? "
+            "ORDER BY first_seen DESC",
+            conn,
+            params=(since,),
+        )
 
 
 def get_all_companies() -> pd.DataFrame:
@@ -284,8 +534,8 @@ def update_website_phones(results: list[dict]) -> int:
             "UPDATE companies SET website_phone = ?, website_phone_type = ?, "
             "website_phone2 = ?, website_phone2_type = ?, "
             "website_email = ?, website_email2 = ?, "
-            "updated_at = ? WHERE id = ?",
-            rows,
+            "updated_at = ?, last_updated = ?, last_seen = ? WHERE id = ?",
+            [(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[6], r[6], r[7]) for r in rows],
         )
         conn.commit()
     return len(rows)

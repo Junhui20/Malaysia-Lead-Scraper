@@ -46,6 +46,13 @@ A Python web scraping tool with Streamlit GUI for extracting business contacts, 
 - Export to Excel (.xlsx) and CSV with column selection
 - Import from Excel / CSV with automatic column mapping
 - Duplicate detection on import
+- **Delta export** — export only companies newly added since a date (fresh monthly list)
+
+### Saved Searches & Scheduled Refresh
+- Save the parameters of any scrape as a named **saved search**
+- Headless CLI runner (`refresh.py`) re-runs saved searches on a schedule
+- Incremental change detection: new companies get a `first_seen` timestamp; companies whose phone / email / website changed get a `last_updated` timestamp
+- Export "new since date X" to Excel from the UI or the CLI
 
 ### Coverage Areas (Configurable)
 
@@ -94,13 +101,71 @@ python build_package.py
 
 Creates a self-contained zip in `dist/LeadScraper/` — recipients just unzip and double-click `run.bat`. No Python installation needed.
 
+## Scheduled Monthly Refresh
+
+The tool can re-run your saved searches automatically and track what's new, so
+you can sell a "fresh monthly list" subscription instead of a one-off export.
+
+### 1. Save a search
+
+Run a scrape from the **Dashboard**, then open **"Save this search for monthly
+refresh"** and give it a name. Manage saved searches under the **Saved Searches**
+page.
+
+### 2. Run the headless refresh runner
+
+`refresh.py` runs without the Streamlit UI and reuses the same scraper, dedup,
+and website-verification pipeline:
+
+```bash
+python refresh.py                                  # refresh all saved searches
+python refresh.py --search "PJ cafes"              # refresh one saved search
+python refresh.py --list                           # list saved searches
+python refresh.py --no-verify                      # skip website phone/email checks
+python refresh.py --concurrency 5                  # more concurrent browser tabs
+
+# Export just the new leads to Excel:
+python refresh.py --export-new-since 2026-07-01 --output new_leads.xlsx
+```
+
+New companies get a `first_seen` timestamp; existing companies whose phone,
+email, or website changed get a `last_updated` timestamp. Everything else just
+has its `last_seen` bumped so it isn't re-exported as "new".
+
+### 3. Schedule it
+
+> **Note:** the commands below only *describe* how to schedule the runner — run
+> them yourself on the target machine. Nothing is scheduled automatically.
+
+**Windows (Task Scheduler)** — the primary deploy target (portable build). From
+the unzipped package folder, create a task that runs on the 1st of each month:
+
+```bat
+schtasks /Create ^
+  /TN "LeadScraper Monthly Refresh" ^
+  /TR "\"C:\LeadScraper\python\python.exe\" \"C:\LeadScraper\refresh.py\"" ^
+  /SC MONTHLY /D 1 /ST 02:00
+```
+
+Or use the Task Scheduler GUI: **Create Basic Task -> Monthly**, action **Start a
+program**, program `python\python.exe` (bundled), argument `refresh.py`, "Start
+in" set to the package folder. For a source install, point the program at your
+`python.exe` and the script at the repo's `refresh.py`.
+
+**Linux (cron)** — run at 02:00 on the 1st of every month (`crontab -e`):
+
+```cron
+0 2 1 * * cd "/path/to/Malaysia Lead Scraper" && /usr/bin/python3 refresh.py >> refresh.log 2>&1
+```
+
 ## Project Structure
 
 ```
 malaysia-lead-scraper/
-├── app.py              # Streamlit GUI — dashboard, results, settings, history, import/export
+├── app.py              # Streamlit GUI — dashboard, results, saved searches, settings, history, import/export
+├── refresh.py          # Headless CLI runner — scheduled incremental refresh + delta export
 ├── scrapers.py         # Web scrapers — Google Maps, JobStreet, Hiredly (Playwright)
-├── database.py         # SQLite data layer — companies, sessions, tags, settings
+├── database.py         # SQLite data layer — companies, sessions, saved searches, tags, settings
 ├── utils.py            # Phone classification, name normalization, validation
 ├── build_package.py    # Windows portable package builder
 ├── requirements.txt    # Python dependencies

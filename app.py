@@ -33,6 +33,7 @@ from database import (
     get_setting, save_setting, import_companies_from_df,
     get_company_count, bulk_append_tag, MAX_IMPORT_ROWS,
     update_website_phones, get_companies_with_website,
+    create_saved_search, get_saved_searches, delete_saved_search,
 )
 from scrapers import (
     scrape_google_maps, scrape_jobstreet, scrape_hiredly,
@@ -367,6 +368,7 @@ with st.sidebar:
         [
             "Dashboard",
             "Results",
+            "Saved Searches",
             "Settings",
             "History",
             "Import / Export",
@@ -473,8 +475,50 @@ def _run_scraping(queries: list[str], gm_max: int, use_gmaps: bool,
         c2.metric("Mobile", mobile)
         c3.metric("Landline", landline)
         c4.metric("No Phone", total - mobile - landline)
+
+        # Remember the exact parameters so this scrape can be saved as a
+        # reusable "saved search" and re-run headlessly by refresh.py.
+        st.session_state["last_scrape_params"] = {
+            "source": ", ".join(sources_used),
+            "params": {
+                "queries": queries,
+                "gm_max": gm_max,
+                "use_gmaps": use_gmaps,
+                "use_jobstreet": use_jobstreet,
+                "js_locations": js_locations or [],
+                "js_pages": js_pages,
+                "use_hiredly": use_hiredly,
+                "hi_max": hi_max,
+                "skip_large": skip_large,
+                "skip_blocklist": skip_blocklist,
+            },
+        }
+        _render_save_search_form()
     else:
         st.warning("No results found. Try different settings.")
+
+
+def _render_save_search_form() -> None:
+    """Offer to persist the most recent scrape as a named saved search."""
+    last = st.session_state.get("last_scrape_params")
+    if not last:
+        return
+    st.divider()
+    with st.expander("Save this search for monthly refresh", expanded=False):
+        st.caption(
+            "Save these exact parameters so the headless runner (refresh.py) "
+            "can re-run them on a schedule and export only what's new."
+        )
+        name = st.text_input("Saved search name", key="save_search_name")
+        if st.button("Save Search", key="save_search_btn"):
+            if not name.strip():
+                st.warning("Give the saved search a name first.")
+            else:
+                create_saved_search(
+                    name.strip(), last["source"], last["params"]
+                )
+                st.success(f"Saved search '{name.strip()}' created.")
+                st.session_state.pop("last_scrape_params", None)
 
 
 def page_dashboard():
@@ -655,8 +699,23 @@ def page_results():
         tags_list = [t["name"] for t in get_tags()]
         tag_filter = st.selectbox("Tag", ["All"] + tags_list)
 
+    # Second filter row: newly-added (delta) filter for the "fresh list" workflow.
+    nf1, nf2 = st.columns([1, 3])
+    with nf1:
+        only_new = st.checkbox("Newly added only", key="results_only_new")
+    with nf2:
+        new_since = st.date_input(
+            "Added on/after", key="results_new_since", disabled=not only_new,
+        )
+
     # Apply filters
     filtered = df.copy()
+    if only_new and "first_seen" in filtered.columns:
+        since_str = str(new_since)
+        filtered = filtered[
+            (filtered["first_seen"].astype(str) != "")
+            & (filtered["first_seen"].astype(str) >= since_str)
+        ]
     if search:
         q = search.lower()
         searchable = ["name", "phone", "address", "category", "website", "tags", "notes"]
@@ -1010,6 +1069,66 @@ def page_history():
 
 
 # ============================================================
+# Page: Saved Searches
+# ============================================================
+
+def page_saved_searches():
+    st.header("Saved Searches")
+    st.caption(
+        "Named searches can be re-run automatically by the headless refresh "
+        "runner (`refresh.py`) to build a fresh monthly list. Save one from the "
+        "**Dashboard** after a scrape completes."
+    )
+
+    searches = get_saved_searches()
+    if not searches:
+        st.info(
+            "No saved searches yet. Run a scrape on the **Dashboard**, then use "
+            "'Save this search for monthly refresh'."
+        )
+        return
+
+    for s in searches:
+        p = s.get("params", {})
+        parts = []
+        if p.get("use_gmaps") and p.get("queries"):
+            parts.append(f"Google Maps: {len(p['queries'])} quer(y/ies)")
+        if p.get("use_jobstreet") and p.get("js_locations"):
+            parts.append(f"JobStreet: {', '.join(p['js_locations'])}")
+        if p.get("use_hiredly"):
+            parts.append(f"Hiredly: {p.get('hi_max', 0)}")
+        summary = " | ".join(parts) or s.get("source", "")
+        last_run = s.get("last_run_at") or "never"
+
+        st.markdown(
+            f'<div style="background:white;border-radius:15px;padding:16px 22px;'
+            f'margin-bottom:12px;box-shadow:0px 3.5px 5.5px rgba(0,0,0,0.02)">'
+            f'<div style="font-weight:700;font-size:0.9rem;color:#2D3748">'
+            f'{html_mod.escape(s["name"])}</div>'
+            f'<div style="font-size:0.75rem;color:#A0AEC0;margin-top:4px">'
+            f'{html_mod.escape(summary)} &nbsp; | &nbsp; last run: '
+            f'{html_mod.escape(str(last_run)[:16])}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        col1, col2 = st.columns([4, 1])
+        with col2:
+            if st.button("Delete", key=f"del_search_{s['id']}", use_container_width=True):
+                delete_saved_search(s["id"])
+                st.success(f"Deleted saved search '{s['name']}'")
+                time.sleep(0.5)
+                st.rerun()
+
+    st.divider()
+    st.markdown(
+        "**Refresh from the command line:**\n\n"
+        "```\npython refresh.py                 # refresh all saved searches\n"
+        "python refresh.py --search \"NAME\"    # refresh one\n"
+        "python refresh.py --export-new-since 2026-07-01 --output new_leads.xlsx\n```"
+    )
+
+
+# ============================================================
 # Page: Import / Export
 # ============================================================
 
@@ -1028,19 +1147,38 @@ def page_import_export():
         else:
             # Filter options
             st.caption("Apply filters before exporting")
-            ex_phone = st.selectbox(
-                "Phone Filter",
-                ["All", "Mobile only", "Landline only", "Has phone", "No phone"],
-                key="ex_phone",
-            )
+            xf1, xf2 = st.columns(2)
+            with xf1:
+                ex_phone = st.selectbox(
+                    "Phone Filter",
+                    ["All", "Mobile only", "Landline only", "Has phone", "No phone"],
+                    key="ex_phone",
+                )
+            with xf2:
+                only_new = st.checkbox(
+                    "Only newly added (delta)", key="ex_only_new",
+                    help="Export only companies first seen on/after the date below "
+                         "— ideal for a fresh monthly list.",
+                )
+                new_since = st.date_input(
+                    "Added on/after", key="ex_new_since",
+                    disabled=not only_new,
+                )
 
             export_df = _apply_phone_filter(df.copy(), ex_phone)
+            if only_new and "first_seen" in export_df.columns:
+                since_str = str(new_since)
+                export_df = export_df[
+                    (export_df["first_seen"].astype(str) != "")
+                    & (export_df["first_seen"].astype(str) >= since_str)
+                ]
 
             # Column selection
             export_cols = [
                 "name", "phone", "phone_type", "website_phone", "website_phone2",
                 "website_email", "website_email2", "website",
                 "address", "category", "company_size", "tags", "notes", "sources",
+                "first_seen", "last_updated",
             ]
             selected_cols = st.multiselect(
                 "Columns to export", export_cols, default=export_cols[:10], key="ex_cols"
@@ -1116,6 +1254,8 @@ def page_import_export():
 
 if "Dashboard" in page:
     page_dashboard()
+elif "Saved Searches" in page:
+    page_saved_searches()
 elif "Results" in page:
     page_results()
 elif "Settings" in page:
