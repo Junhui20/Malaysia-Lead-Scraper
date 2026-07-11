@@ -685,9 +685,10 @@ def page_results():
     # --- Column visibility ---
     all_cols = [
         "name", "phone", "phone_type", "website_phone", "website_phone2",
+        "website_email", "website_email2",
         "website", "address", "category", "tags", "notes", "sources",
     ]
-    default_vis = ["name", "phone", "phone_type", "website_phone", "website_phone2", "website", "address", "category", "tags", "sources"]
+    default_vis = ["name", "phone", "phone_type", "website_phone", "website_phone2", "website_email", "website", "address", "category", "tags", "sources"]
     visible = st.multiselect(
         "Visible Columns", all_cols, default=default_vis, key="vis_cols"
     )
@@ -713,6 +714,8 @@ def page_results():
             ),
             "website_phone": st.column_config.TextColumn("Phone (Website)", width="medium"),
             "website_phone2": st.column_config.TextColumn("Phone 2 (Website)", width="medium"),
+            "website_email": st.column_config.TextColumn("Email (Website)", width="medium"),
+            "website_email2": st.column_config.TextColumn("Email 2 (Website)", width="medium"),
             "website": st.column_config.LinkColumn("Website", width="medium"),
             "address": st.column_config.TextColumn("Address", width="large"),
             "category": st.column_config.TextColumn("Industry", width="medium"),
@@ -758,10 +761,10 @@ def page_results():
 
     # --- Website Phone Verification ---
     st.divider()
-    st.subheader("Verify Phones from Company Websites")
+    st.subheader("Verify Phones & Emails from Company Websites")
     st.caption(
-        "Visit each company's website to find phone numbers. "
-        "Results are stored in the 'Phone (Website)' column for comparison."
+        "Visit each company's website to find phone numbers and email addresses. "
+        "Results are stored in the 'Phone (Website)' and 'Email (Website)' columns."
     )
 
     companies_with_web = get_companies_with_website()
@@ -807,9 +810,11 @@ def page_results():
             progress.progress(1.0)
 
             found = sum(1 for r in results if r.get("website_phone"))
+            found_email = sum(1 for r in results if r.get("website_email"))
             st.success(
                 f"Done! Checked {len(results)} websites. "
-                f"Found phones on {found}. Updated {saved} records."
+                f"Found phones on {found}, emails on {found_email}. "
+                f"Updated {saved} records."
             )
             time.sleep(1)
             st.rerun()
@@ -1033,11 +1038,12 @@ def page_import_export():
 
             # Column selection
             export_cols = [
-                "name", "phone", "phone_type", "website_phone", "website",
+                "name", "phone", "phone_type", "website_phone", "website_phone2",
+                "website_email", "website_email2", "website",
                 "address", "category", "company_size", "tags", "notes", "sources",
             ]
             selected_cols = st.multiselect(
-                "Columns to export", export_cols, default=export_cols[:9], key="ex_cols"
+                "Columns to export", export_cols, default=export_cols[:10], key="ex_cols"
             )
 
             st.metric("Rows to export", f"{len(export_df):,}")

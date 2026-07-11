@@ -46,6 +46,8 @@ def init_db() -> None:
                 website_phone_type TEXT DEFAULT '',
                 website_phone2 TEXT DEFAULT '',
                 website_phone2_type TEXT DEFAULT '',
+                website_email TEXT DEFAULT '',
+                website_email2 TEXT DEFAULT '',
                 address TEXT DEFAULT '',
                 category TEXT DEFAULT '',
                 company_size TEXT DEFAULT '',
@@ -91,13 +93,49 @@ def init_db() -> None:
         if "website_phone2" not in existing_cols:
             conn.execute("ALTER TABLE companies ADD COLUMN website_phone2 TEXT DEFAULT ''")
             conn.execute("ALTER TABLE companies ADD COLUMN website_phone2_type TEXT DEFAULT ''")
+        # Migrate: add website_email columns if missing (existing databases)
+        if "website_email" not in existing_cols:
+            conn.execute("ALTER TABLE companies ADD COLUMN website_email TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE companies ADD COLUMN website_email2 TEXT DEFAULT ''")
+
+        # Migrate: rename old Chinese default tags to English (existing databases).
+        # Runs before the default-tag insert so the rename applies cleanly. Idempotent:
+        # only acts when the Chinese-named tag still exists. The tag row is updated in
+        # place (id + color preserved) and the comma-separated tag strings stored on
+        # companies are rewritten so existing assignments carry over.
+        tag_renames = {
+            "已打電話": "Called",
+            "有興趣": "Interested",
+            "不要再打": "Do Not Call",
+            "待跟進": "Follow Up",
+            "重要客戶": "Key Account",
+        }
+        for old_name, new_name in tag_renames.items():
+            if not conn.execute(
+                "SELECT 1 FROM tags WHERE name = ?", (old_name,)
+            ).fetchone():
+                continue
+            if conn.execute(
+                "SELECT 1 FROM tags WHERE name = ?", (new_name,)
+            ).fetchone():
+                # English tag already present — drop the stale Chinese duplicate.
+                conn.execute("DELETE FROM tags WHERE name = ?", (old_name,))
+            else:
+                conn.execute(
+                    "UPDATE tags SET name = ? WHERE name = ?", (new_name, old_name)
+                )
+            # Rewrite assignments stored as text in companies.tags either way.
+            conn.execute(
+                "UPDATE companies SET tags = REPLACE(tags, ?, ?) WHERE tags LIKE ?",
+                (old_name, new_name, f"%{old_name}%"),
+            )
 
         default_tags = [
-            ("已打電話", "#3B82F6"),
-            ("有興趣", "#10B981"),
-            ("不要再打", "#EF4444"),
-            ("待跟進", "#F59E0B"),
-            ("重要客戶", "#8B5CF6"),
+            ("Called", "#3B82F6"),
+            ("Interested", "#10B981"),
+            ("Do Not Call", "#EF4444"),
+            ("Follow Up", "#F59E0B"),
+            ("Key Account", "#8B5CF6"),
         ]
         for name, color in default_tags:
             conn.execute(
@@ -198,7 +236,7 @@ def get_company_count() -> int:
 
 def update_companies_from_df(df: pd.DataFrame) -> int:
     """Batch update companies from an edited DataFrame. Returns rows updated."""
-    editable = {"name", "phone", "phone_type", "website", "website_phone", "website_phone_type", "address", "category", "tags", "notes"}
+    editable = {"name", "phone", "phone_type", "website", "website_phone", "website_phone_type", "website_email", "website_email2", "address", "category", "tags", "notes"}
     cols_in_df = [c for c in df.columns if c in editable and is_safe_column_name(c)]
     if not cols_in_df:
         return 0
@@ -226,17 +264,18 @@ def update_companies_from_df(df: pd.DataFrame) -> int:
 
 
 def update_website_phones(results: list[dict]) -> int:
-    """Bulk update website_phone from verification results. Returns count updated."""
+    """Bulk update website phone/email from verification results. Returns count updated."""
     if not results:
         return 0
     now = datetime.now().isoformat()
     rows = [
         (
-            r["website_phone"], r.get("website_phone_type", ""),
+            r.get("website_phone", ""), r.get("website_phone_type", ""),
             r.get("website_phone2", ""), r.get("website_phone2_type", ""),
+            r.get("website_email", ""), r.get("website_email2", ""),
             now, r["id"],
         )
-        for r in results if r.get("website_phone")
+        for r in results if r.get("website_phone") or r.get("website_email")
     ]
     if not rows:
         return 0
@@ -244,6 +283,7 @@ def update_website_phones(results: list[dict]) -> int:
         conn.executemany(
             "UPDATE companies SET website_phone = ?, website_phone_type = ?, "
             "website_phone2 = ?, website_phone2_type = ?, "
+            "website_email = ?, website_email2 = ?, "
             "updated_at = ? WHERE id = ?",
             rows,
         )

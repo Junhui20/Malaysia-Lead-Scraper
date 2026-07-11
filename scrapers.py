@@ -988,6 +988,102 @@ def _is_fax_context(text: str) -> bool:
     return bool(_FAX_PATTERN.search(text))
 
 
+# ---- Email extraction ----
+
+# Fairly strict address pattern (avoids trailing punctuation / entities)
+EMAIL_PATTERN = re.compile(
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?\.[A-Za-z]{2,24}"
+)
+
+# Placeholder / vendor / tracking domains that are never real contact addresses
+_EMAIL_JUNK_DOMAINS = frozenset([
+    "example.com", "example.org", "example.net", "domain.com", "domain.tld",
+    "yourdomain.com", "yourcompany.com", "email.com", "sentry.io",
+    "wixpress.com", "sentry-next.wixpress.com", "wix.com", "godaddy.com",
+    "squarespace.com", "sentry.wixpress.com",
+])
+
+# Substrings that mark a domain as an asset/tracking host rather than a mailbox
+_EMAIL_JUNK_SUBSTR = ("sentry", "wixpress", "example.", "@2x", "@3x")
+
+# File extensions that show up when an image/asset filename looks like an email
+# (e.g. logo@2x.png -> local "logo", domain "2x.png")
+_EMAIL_ASSET_EXT = re.compile(
+    r"\.(png|jpe?g|gif|svg|webp|bmp|ico|tiff?|css|js|json|woff2?|ttf|eot|mp4|webm|pdf)$",
+    re.IGNORECASE,
+)
+
+
+def _is_junk_email(local: str, domain: str) -> bool:
+    """True if a parsed local@domain pair is not a usable contact address."""
+    if domain in _EMAIL_JUNK_DOMAINS:
+        return True
+    if _EMAIL_ASSET_EXT.search(domain) or _EMAIL_ASSET_EXT.search(local):
+        return True
+    full = f"{local}@{domain}"
+    if any(s in full for s in _EMAIL_JUNK_SUBSTR):
+        return True
+    # Hash-like / obviously non-human local parts (minified bundles, ids)
+    if len(local) > 40 or re.fullmatch(r"[0-9a-f]{16,}", local):
+        return True
+    tld = domain.rsplit(".", 1)[-1]
+    if len(tld) < 2 or not tld.isalpha():
+        return True
+    return False
+
+
+def extract_emails(text: str, mailto_hrefs: list[str] | None = None) -> list[str]:
+    """Extract cleaned, de-duplicated emails from page text and mailto: links.
+
+    mailto links are considered first (highest signal). Filters out placeholder
+    domains (example.com), vendor/tracking hosts (sentry, wixpress) and image /
+    asset filenames that superficially look like addresses. Pure function — no
+    browser access — so it can be exercised offline against an HTML string.
+    """
+    candidates: list[str] = []
+    for href in (mailto_hrefs or []):
+        addr = href.split("mailto:", 1)[-1].split("?", 1)[0]
+        addr = addr.replace("%40", "@").strip()
+        if addr:
+            candidates.append(addr)
+    candidates.extend(m.group(0) for m in EMAIL_PATTERN.finditer(text or ""))
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in candidates:
+        email = raw.strip().strip(".,;:<>()[]\"'").lower().replace("%40", "@")
+        if email.count("@") != 1:
+            continue
+        local, _, domain = email.partition("@")
+        if not local or "." not in domain:
+            continue
+        if _is_junk_email(local, domain):
+            continue
+        if email in seen:
+            continue
+        seen.add(email)
+        result.append(email)
+    return result
+
+
+async def _extract_emails_from_page(page) -> list[str]:
+    """Collect mailto: links + regex over the page body, then clean/filter."""
+    mailto: list[str] = []
+    try:
+        for link in await page.query_selector_all('a[href^="mailto:"]'):
+            href = (await link.get_attribute("href")) or ""
+            if href:
+                mailto.append(href)
+    except Exception:
+        pass
+    text = ""
+    try:
+        text = await page.inner_text("body")
+    except Exception:
+        pass
+    return extract_emails(text, mailto)
+
+
 async def _extract_phones_from_page(page) -> list[dict]:
     """Extract phone numbers from a single page. Returns list of {phone, confidence}.
     Skips fax numbers automatically.
@@ -1065,7 +1161,10 @@ async def _verify_one_website(context, company: dict) -> dict:
         "website_phone2": "",
         "website_phone2_type": "",
         "website_phone_source": "",
+        "website_email": "",
+        "website_email2": "",
         "all_phones": [],
+        "all_emails": [],
     }
 
     page = await context.new_page()
@@ -1081,6 +1180,7 @@ async def _verify_one_website(context, company: dict) -> dict:
 
         await _sleep(1)
         all_phones = await _extract_phones_from_page(page)
+        all_emails = await _extract_emails_from_page(page)
 
         # Try contact page
         contact_url = await _find_contact_page_url(page)
@@ -1101,6 +1201,9 @@ async def _verify_one_website(context, company: dict) -> dict:
                             if a["phone"] == ph["phone"] and ph["confidence"] == "high":
                                 a["confidence"] = "high"
                                 break
+                for em in await _extract_emails_from_page(page):
+                    if em not in all_emails:
+                        all_emails.append(em)
             except Exception:
                 pass
 
@@ -1125,6 +1228,12 @@ async def _verify_one_website(context, company: dict) -> dict:
                 second = all_phones[1]
                 entry["website_phone2"] = second["phone"]
                 entry["website_phone2_type"] = classify_phone(second["phone"])
+
+        entry["all_emails"] = all_emails
+        if all_emails:
+            entry["website_email"] = all_emails[0]
+            if len(all_emails) >= 2:
+                entry["website_email2"] = all_emails[1]
 
     finally:
         await page.close()
